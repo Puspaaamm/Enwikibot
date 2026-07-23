@@ -27,7 +27,7 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 # Aapka Telegram Bot Token set kar diya gaya hai
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "8820491224:AAEqQ9Mzpc4fpRo7LpMyIw3zU-UZ6HQYkI4")
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
 
 WIKI_API_URL = "https://en.wikipedia.org/w/api.php"
 HEADERS = {"User-Agent": "TelegramWikipediaBot/1.0 (personal project)"}
