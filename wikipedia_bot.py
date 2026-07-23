@@ -168,6 +168,26 @@ def main() -> None:
 
     print("Bot is running... Press Ctrl+C to stop.")
     app.run_polling()
+    import os
+from threading import Thread
+from flask import Flask
+
+app = Flask('')
+
+@app.route('/')
+def home():
+    return "Bot is alive!"
+
+def run():
+    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 8080)))
+
+# Main execution
+if __name__ == "__main__":
+    # Flask app ko alag thread me chalayein
+    Thread(target=run).start()
+    # Bot start karein
+    main()
+
 
 
 if __name__ == "__main__":
