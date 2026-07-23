@@ -1,15 +1,11 @@
-"""
-Telegram bot that searches English Wikipedia and sends back an image + summary.
-
-Bot Username:@Enwikibot
-"""
-
 import asyncio
 import logging
 import os
-from typing import Dict, Optional, Tuple
+from threading import Thread
+from typing import Dict, List, Optional, Tuple
 
 import requests
+from flask import Flask
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -19,6 +15,18 @@ from telegram.ext import (
     filters,
 )
 
+# Render port binding ke liye Flask Server
+app = Flask('')
+
+@app.route('/')
+def home():
+    return "Bot is alive!"
+
+def run_flask():
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host='0.0.0.0', port=port)
+
+# Logging Setup
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
@@ -26,22 +34,18 @@ logging.basicConfig(
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
-# Aapka Telegram Bot Token set kar diya gaya hai
+# Environment variable se Token fetch karein
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 
 WIKI_API_URL = "https://en.wikipedia.org/w/api.php"
 HEADERS = {"User-Agent": "TelegramWikipediaBot/1.0 (personal project)"}
 
-MAX_WORDS = 500             # Max words to display
-MAX_MESSAGE_LENGTH = 4000   # Telegram character margin limit
-THUMBNAIL_WIDTH = 600       # Image resolution limit
-
-# Active tasks per chat to allow task cancellation for fast input
+MAX_MESSAGE_LENGTH = 3800  # Telegram limit margin
 active_tasks: Dict[int, asyncio.Task] = {}
 
 
 def search_title(query: str) -> Optional[str]:
-    """Return the title of the best-matching English Wikipedia article."""
+    """Search best matching article title."""
     params = {
         "action": "query",
         "list": "search",
@@ -55,55 +59,94 @@ def search_title(query: str) -> Optional[str]:
     return results[0]["title"] if results else None
 
 
-def fetch_extract_and_image(title: str) -> Tuple[Optional[str], Optional[str]]:
-    """Return (full plain-text extract, lead-image URL) for a Wikipedia page."""
+def fetch_article_data(title: str) -> Tuple[Optional[str], List[Tuple[str, str]]]:
+    """Fetch text extract and all images (with titles/captions) from pageimages API."""
     params = {
         "action": "query",
-        "prop": "extracts|pageimages",
+        "prop": "extracts|images",
         "explaintext": 1,
         "redirects": 1,
-        "pithumbsize": THUMBNAIL_WIDTH,
         "titles": title,
         "format": "json",
+        "imlimit": 10  # Max 10 images to avoid spamming
     }
     resp = requests.get(WIKI_API_URL, params=params, headers=HEADERS, timeout=20)
     resp.raise_for_status()
     pages = resp.json().get("query", {}).get("pages", {})
+
+    extract = None
+    image_files = []
+
     for page_id, page in pages.items():
         if page_id == "-1":
-            return None, None
+            return None, []
         extract = page.get("extract") or None
-        thumbnail = page.get("thumbnail", {}).get("source")
-        return extract, thumbnail
-    return None, None
+        images = page.get("images", [])
+        
+        # Valid image formats filter karein (SVG diagrams, JPG, PNG)
+        for img in images:
+            img_name = img.get("title", "")
+            if any(img_name.lower().endswith(ext) for ext in [".jpg", ".jpeg", ".png", ".svg"]):
+                # Skip common icons/logos
+                if not any(skip in img_name.lower() for skip in ["wiki", "icon", "symbol", "logo", "padlock"]):
+                    image_files.append(img_name)
+
+    # Fetch direct image URLs for found images
+    image_urls_with_captions = []
+    if image_files:
+        img_params = {
+            "action": "query",
+            "titles": "|".join(image_files[:8]),  # Top 8 images
+            "prop": "imageinfo",
+            "iiprop": "url",
+            "format": "json"
+        }
+        img_resp = requests.get(WIKI_API_URL, params=img_params, headers=HEADERS, timeout=15)
+        if img_resp.status_code == 200:
+            img_pages = img_resp.json().get("query", {}).get("pages", {})
+            for p_id, p_data in img_pages.items():
+                img_info = p_data.get("imageinfo", [])
+                if img_info:
+                    url = img_info[0].get("url")
+                    caption = p_data.get("title", "").replace("File:", "").replace(".jpg", "").replace(".png", "")
+                    if url and not url.endswith(".svg"):  # Telegram SVG support nahi karta direct photo me
+                        image_urls_with_captions.append((url, caption))
+
+    return extract, image_urls_with_captions
 
 
 async def fetch_article(query: str) -> Optional[dict]:
-    """Search & fetch article off-main-thread using asyncio.to_thread."""
     title = await asyncio.to_thread(search_title, query)
     if not title:
         return None
-    extract, thumbnail = await asyncio.to_thread(fetch_extract_and_image, title)
-    return {"title": title, "extract": extract, "thumbnail": thumbnail}
+    extract, images = await asyncio.to_thread(fetch_article_data, title)
+    return {"title": title, "extract": extract, "images": images}
 
 
-def truncate_to_words(text: str, max_words: int) -> Tuple[str, bool]:
-    """Truncate text to specified word count."""
-    words = text.split()
-    if len(words) <= max_words:
-        return text.strip(), False
-    return " ".join(words[:max_words]) + " …", True
+def split_text_into_chunks(text: str, max_length: int = MAX_MESSAGE_LENGTH):
+    chunks = []
+    while len(text) > max_length:
+        split_at = text.rfind('\n', 0, max_length)
+        if split_at == -1:
+            split_at = text.rfind(' ', 0, max_length)
+        if split_at == -1:
+            split_at = max_length
+
+        chunks.append(text[:split_at].strip())
+        text = text[split_at:].strip()
+
+    if text:
+        chunks.append(text)
+    return chunks
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "Hi! Send me any topic and I'll fetch its English Wikipedia image + "
-        "a 500-word summary -- e.g. 'Mahatma Gandhi' or 'Black holes'."
+        "Hi! Send me any topic and I'll fetch its English Wikipedia article text along with diagrams & images with captions!"
     )
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Cancels any previous task and starts a fresh search request."""
     query = (update.message.text or "").strip()
     if not query:
         return
@@ -112,7 +155,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     previous = active_tasks.get(chat_id)
     if previous and not previous.done():
         previous.cancel()
-        logger.info("Chat %s: cancelled previous search for a newer query", chat_id)
 
     active_tasks[chat_id] = asyncio.create_task(process_search(update, query))
 
@@ -120,76 +162,58 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 async def process_search(update: Update, query: str) -> None:
     try:
         await update.effective_chat.send_action("typing")
-
         result = await fetch_article(query)
         if result is None:
             await update.message.reply_text(f'No Wikipedia article found for "{query}".')
             return
 
-        title, extract, thumbnail = result["title"], result["extract"], result["thumbnail"]
+        title, extract, images = result["title"], result["extract"], result["images"]
         if not extract:
-            await update.message.reply_text(f'Found "{title}" but could not fetch its content.')
+            await update.message.reply_text(f'Found "{title}" but could not fetch content.')
             return
 
         url = "https://en.wikipedia.org/wiki/" + title.replace(" ", "_")
-        summary, was_truncated = truncate_to_words(extract, MAX_WORDS)
-        if len(summary) > MAX_MESSAGE_LENGTH:
-            summary = summary[:MAX_MESSAGE_LENGTH] + " …"
 
-        if thumbnail:
-            try:
-                await update.message.reply_photo(photo=thumbnail, caption=f"📖 {title}")
-            except Exception:
-                logger.warning("Couldn't send image for '%s', falling back to text", title)
-                await update.message.reply_text(f"📖 {title}")
-        else:
-            await update.message.reply_text(f"📖 {title}")
+        await update.message.reply_text(f"📖 *{title}*", parse_mode="Markdown")
 
-        await update.message.reply_text(summary)
+        # 1. Full Article Text Send Karein
+        chunks = split_text_into_chunks(extract)
+        for chunk in chunks:
+            await update.message.reply_text(chunk)
+            await asyncio.sleep(0.4)
 
-        note = "\n\n(Showing the first 500 words.)" if was_truncated else ""
-        await update.message.reply_text(f"🔗 Full article: {url}{note}")
+        # 2. Article ki Images aur Diagrams With Caption Send Karein
+        if images:
+            await update.message.reply_text(" *Available Images & Diagrams from article:*", parse_mode="Markdown")
+            for img_url, caption in images:
+                try:
+                    await update.message.reply_photo(photo=img_url, caption=f" {caption}")
+                    await asyncio.sleep(0.5)
+                except Exception:
+                    continue
+
+        # 3. Web Link
+        await update.message.reply_text(f"🔗 Full original article web link: {url}")
 
     except asyncio.CancelledError:
-        logger.info("Search for '%s' cancelled -- a newer search took over", query)
         raise
-    except requests.RequestException:
-        logger.exception("Wikipedia API error")
-        await update.message.reply_text("Couldn't reach Wikipedia right now -- try again shortly.")
     except Exception:
-        logger.exception("Unexpected error handling message")
         await update.message.reply_text("Something went wrong. Please try again.")
 
 
 def main() -> None:
-    app = Application.builder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    if not BOT_TOKEN:
+        raise SystemExit("BOT_TOKEN is missing!")
 
-    print("Bot is running... Press Ctrl+C to stop.")
-    app.run_polling()
-    import os
-from threading import Thread
-from flask import Flask
+    app_bot = Application.builder().token(BOT_TOKEN).build()
+    app_bot.add_handler(CommandHandler("start", start))
+    app_bot.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-app = Flask('')
-
-@app.route('/')
-def home():
-    return "Bot is alive!"
-
-def run():
-    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 8080)))
-
-# Main execution
-if __name__ == "__main__":
-    # Flask app ko alag thread me chalayein
-    Thread(target=run).start()
-    # Bot start karein
-    main()
-
+    print("Bot is running...")
+    app_bot.run_polling()
 
 
 if __name__ == "__main__":
+    Thread(target=run_flask, daemon=True).start()
     main()
 
