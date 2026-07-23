@@ -1,0 +1,2 @@
+worker: python wikipedia_bot.py
+
